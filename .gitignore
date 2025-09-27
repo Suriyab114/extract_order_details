@@ -1,0 +1,23 @@
+Environments
+.env
+venv/
+env/
+
+Python artifacts
+pycache/
+*.pyc
+*.egg-info/
+dist/
+
+IDE files
+.vscode/
+.idea/
+
+Database files
+*.db
+*.sqlite
+*.sqlite3
+
+Logs
+*.log
+logs/
