@@ -1,60 +1,81 @@
 import os
 import sqlite3
 import pandas as pd
-import pyzipper
+import json
 
 DB_NAME = "order_details.db"
 
 # -------------------------------
 # 1. Extract Step
 # -------------------------------
-def read_encrypted_csv(zip_path, password):
-    """Read password-protected ZIP containing a CSV and return DataFrame."""
-    with pyzipper.AESZipFile(zip_path) as zf:
-        zf.pwd = password.encode()
-        csv_name = zf.namelist()[0]  # assume only one CSV inside
-        with zf.open(csv_name) as f:
-            df = pd.read_csv(f)
-    return df
-
-
-def extract_data(file_a, pass_a, file_b, pass_b):
-    df_a = read_encrypted_csv(file_a, pass_a)
+def extract_data(file_a, file_b):
+    """Read CSV files from Region A and B."""
+    df_a = pd.read_csv(file_a)
     df_a["region"] = "A"
 
-    df_b = read_encrypted_csv(file_b, pass_b)
+    df_b = pd.read_csv(file_b)
     df_b["region"] = "B"
 
     combined = pd.concat([df_a, df_b], ignore_index=True)
+    print(combined.head())
     return combined
 
 
 # -------------------------------
-# 2. Transform Step
+# 2. Transform csv to json 
+# -------------------------------
+def clean_promotion_discount(df):
+    """Convert PromotionDiscount JSON string to numeric Amount."""
+    def extract_amount(x):
+        try:
+            # Some CSVs have quotes, so remove extra quotes
+            if isinstance(x, str):
+                x = x.replace('""', '"')
+                data = json.loads(x)
+                return float(data["Amount"])
+            return 0.0
+        except Exception:
+            return 0.0
+    df["PromotionDiscount"] = df["PromotionDiscount"].apply(extract_amount)
+    return df
+
+
+
+# -------------------------------
+# 3. Transform Step
 # -------------------------------
 def transform_data(df):
-    # Business rules
+    df = clean_promotion_discount(df)
+
+    # Ensure other columns are numeric
+    df["QuantityOrdered"] = pd.to_numeric(df["QuantityOrdered"], errors="coerce")
+    df["ItemPrice"] = pd.to_numeric(df["ItemPrice"], errors="coerce")
+
+    # Drop rows with missing essential values
+    df = df.dropna(subset=["QuantityOrdered", "ItemPrice", "PromotionDiscount"])
+
+    # Apply business rules
     df["total_sales"] = df["QuantityOrdered"] * df["ItemPrice"]
     df["net_sale"] = df["total_sales"] - df["PromotionDiscount"]
 
-    # Remove duplicates based on OrderId (keep first occurrence)
+    # Drop duplicates based on OrderId
     df = df.drop_duplicates(subset=["OrderId"], keep="first")
 
-    # Exclude orders where net_sale <= 0
+    # Remove rows where net_sale <= 0
     df = df[df["net_sale"] > 0]
 
     return df
 
 
 # -------------------------------
-# 3. Load Step
+# 4. Load Step
 # -------------------------------
 def create_order_details_table():
+    """Create SQLite table order_details."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sales_data (
+        CREATE TABLE IF NOT EXISTS order_details (
             OrderId TEXT PRIMARY KEY,
             OrderItemId TEXT,
             QuantityOrdered INTEGER,
@@ -70,36 +91,38 @@ def create_order_details_table():
 
 
 def load_data(df):
+    """Load transformed DataFrame into SQLite."""
     conn = sqlite3.connect(DB_NAME)
-    df.to_sql("sales_data", conn, if_exists="replace", index=False)
+    df.to_sql("order_details", conn, if_exists="replace", index=False)
     conn.close()
 
 
 # -------------------------------
-# 4. Validation Queries
+# 5. Validation Queries
 # -------------------------------
 def run_validation_queries():
+    """Run SQL queries to validate loaded data."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
     print("\n--- Validation Queries ---")
 
     # a. Count total records
-    cursor.execute("SELECT COUNT(*) FROM sales_data")
+    cursor.execute("SELECT COUNT(*) FROM order_details")
     print("Total records:", cursor.fetchone()[0])
 
-    # b. Total sales amount by region
-    cursor.execute("SELECT region, SUM(net_sale) FROM sales_data GROUP BY region")
+    # b. Total sales by region
+    cursor.execute("SELECT region, SUM(net_sale) FROM order_details GROUP BY region")
     print("Total sales by region:", cursor.fetchall())
 
-    # c. Average sales amount per transaction
-    cursor.execute("SELECT AVG(net_sale) FROM sales_data")
+    # c. Average sales per transaction
+    cursor.execute("SELECT AVG(net_sale) FROM order_details")
     print("Average sales per transaction:", cursor.fetchone()[0])
 
-    # d. Ensure no duplicate OrderIds
+    # d. Duplicate OrderIds
     cursor.execute("""
         SELECT OrderId, COUNT(*) 
-        FROM sales_data 
+        FROM order_details 
         GROUP BY OrderId 
         HAVING COUNT(*) > 1
     """)
@@ -113,13 +136,12 @@ def run_validation_queries():
 
 
 # -------------------------------
-# 5. Main ETL Pipeline
+# 6. Main ETL Pipeline
 # -------------------------------
 def main():
-    file_a = "data/order_region_a.zip"
-    file_b = "data/order_region_b.zip"
-    pass_a = "order_region_a"
-    pass_b = "order_region_b"
+    # ✅ Use raw string for Windows paths (or escape backslashes)
+    file_a = "order_region_a.csv"
+    file_b = "order_region_b.csv"
 
     if os.path.exists(DB_NAME):
         os.remove(DB_NAME)
@@ -128,7 +150,7 @@ def main():
     print("\n--- Starting ETL Pipeline ---")
 
     try:
-        extracted = extract_data(file_a, pass_a, file_b, pass_b)
+        extracted = extract_data(file_a, file_b)
         transformed = transform_data(extracted)
         create_order_details_table()
         load_data(transformed)
